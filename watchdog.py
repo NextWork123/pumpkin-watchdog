@@ -8,11 +8,11 @@ import traceback
 import urllib.parse
 from dataclasses import dataclass
 from typing import IO, Any, List, Optional, Union
-
+from functools import lru_cache
 from aiohttp import web
 
 
-@dataclass
+@dataclass(frozen=True)
 class SubprocessError(Exception):
     stdout: Optional[bytes]
     stderr: Optional[bytes]
@@ -44,6 +44,11 @@ async def run_command(cmd: str, env: Optional[dict] = None) -> None:
         )
 
 
+@lru_cache(maxsize=128)
+def get_log_file_path(log_dir: str, commit: str, counter: int, is_stderr: bool = False) -> str:
+    return os.path.join(log_dir, commit, f"{'stderr' if is_stderr else 'stdout'}_{counter}.txt")
+
+
 async def update_rust() -> None:
     print("updating rust")
     await run_command("rustup update")
@@ -66,15 +71,23 @@ async def clean_binary(repo_dir: str, plugins_dir: str) -> None:
     await clean_current_directory()
 
     print("cleaning plugins dir")
+    tasks = []
     for path in os.scandir(plugins_dir):
         os.chdir(path.path)
-        await clean_current_directory()
+        tasks.append(clean_current_directory())
+    await asyncio.gather(*tasks)
 
 
 async def build_plugins(repo_dir: str, plugins_dir: str) -> None:
     plugin_final_dir = os.path.join(repo_dir, "./plugins")
+    build_tasks = []
+    
     for plugin_path in os.scandir(plugins_dir):
-        await build_repo(plugin_path.path, False)
+        build_tasks.append(build_repo(plugin_path.path, False))
+    
+    await asyncio.gather(*tasks)
+    
+    for plugin_path in os.scandir(plugins_dir):
         plugin_output_dir = os.path.join(plugin_path.path, "./target/release/")
         
         for path in os.scandir(plugin_output_dir):
@@ -181,21 +194,6 @@ async def wait_for_process_or_signal(
                 task.cancel()
 
 
-async def handle_webhook(queue: asyncio.Queue[str], request: web.Request) -> web.Response:
-    if request.headers.get("X-GitHub-Event") == "push":
-        raw_data = await request.text()
-        json_data = json.loads(urllib.parse.unquote(raw_data))
-        repo = json_data["repository"]["full_name"]
-        
-        if repo in ("kralverde/Pumpkin", "Snowiiii/Pumpkin", "Pumpkin-MC/Pumpkin"):
-            print(f'commit detected on {json_data["ref"]}')
-            if json_data["ref"] == "refs/heads/master":
-                await queue.put(json_data["after"])
-
-    return web.Response()
-
-
-# Template HTML moved to constant at module level
 INDEX_HTML = """<!DOCTYPE html>
 <html lang="en">
   <head>
@@ -223,17 +221,17 @@ INDEX_HTML = """<!DOCTYPE html>
   </body>
 </html>"""
 
-# Memory cache implementation
+
 class MemoryCache:
     def __init__(self, ttl: int = 5):
-        self.cache = {}
-        self.ttl = ttl
+        self._cache = {}
+        self._ttl = ttl
         
     async def get_memory(self, pid: str) -> str:
         now = time.time()
-        if pid in self.cache:
-            cached_value, timestamp = self.cache[pid]
-            if now - timestamp < self.ttl:
+        if pid in self._cache:
+            cached_value, timestamp = self._cache[pid]
+            if now - timestamp < self._ttl:
                 return cached_value
                 
         try:
@@ -255,7 +253,7 @@ class MemoryCache:
                 data = await proc.stdout.readline()
                 virtual, real = data.strip().decode().split()
                 result = f"{int(virtual)//1000}MB of virtual memory and {int(real)//1000}MB of real memory."
-                self.cache[pid] = (result, now)
+                self._cache[pid] = (result, now)
                 return result
                 
         except Exception as e:
@@ -264,7 +262,23 @@ class MemoryCache:
             
         return "Unknown"
 
+
 memory_cache = MemoryCache()
+
+
+async def handle_webhook(queue: asyncio.Queue[str], request: web.Request) -> web.Response:
+    if request.headers.get("X-GitHub-Event") == "push":
+        raw_data = await request.text()
+        json_data = json.loads(urllib.parse.unquote(raw_data))
+        repo = json_data["repository"]["full_name"]
+        
+        if repo in ("kralverde/Pumpkin", "Snowiiii/Pumpkin", "Pumpkin-MC/Pumpkin"):
+            print(f'commit detected on {json_data["ref"]}')
+            if json_data["ref"] == "refs/heads/master":
+                await queue.put(json_data["after"])
+
+    return web.Response()
+
 
 async def handle_index(
     commit_wrapper: List[Union[str, int]],
@@ -507,8 +521,10 @@ async def binary_runner(
 
     try:
         await mc_queue.put("Updating Plugin Repos...")
+        update_tasks = []
         for path in os.scandir(plugins_dir):
-            await update_git_repo(path.path)
+            update_tasks.append(update_git_repo(path.path))
+        await asyncio.gather(*update_tasks)
     except SubprocessError as e:
         print(f"Warning: Failed to update plugin repo: {e}")
 
@@ -572,8 +588,8 @@ async def binary_runner(
         commit_wrapper[1] = try_counter
         print(f"attempting to start the binary (try count: {try_counter})")
         
-        stdout_path = os.path.join(current_log_dir, f"stdout_{try_counter}.txt")
-        stderr_path = os.path.join(current_log_dir, f"stderr_{try_counter}.txt")
+        stdout_path = get_log_file_path(log_dir, commit, try_counter)
+        stderr_path = get_log_file_path(log_dir, commit, try_counter, True)
 
         with open(stdout_path, "w") as stdout_log, open(stderr_path, "w") as stderr_log:
             await mc_queue.put(None)
@@ -614,8 +630,10 @@ async def binary_runner(
 
             try:
                 await mc_queue.put("Updating Plugin Repos...")
+                update_tasks = []
                 for path in os.scandir(plugins_dir):
-                    await update_git_repo(path.path)
+                    update_tasks.append(update_git_repo(path.path))
+                await asyncio.gather(*update_tasks)
             except SubprocessError as e:
                 print(f"Warning: Failed to update plugin repo: {e}")
                 commit_wrapper[3] = "Unable to update the plugin repos!"
