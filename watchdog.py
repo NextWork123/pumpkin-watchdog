@@ -80,24 +80,40 @@ async def clean_binary(repo_dir: str, plugins_dir: str) -> None:
 
 async def build_plugins(repo_dir: str, plugins_dir: str) -> None:
     plugin_final_dir = os.path.join(repo_dir, "./plugins")
+    os.makedirs(plugin_final_dir, exist_ok=True)
+    
     build_tasks = []
-    
     for plugin_path in os.scandir(plugins_dir):
-        build_tasks.append(build_repo(plugin_path.path, False))
+        if plugin_path.is_dir():
+            build_tasks.append(build_repo(plugin_path.path, False))
     
-    await asyncio.gather(*tasks)
-    
-    for plugin_path in os.scandir(plugins_dir):
-        plugin_output_dir = os.path.join(plugin_path.path, "./target/release/")
+    if build_tasks:
+        await asyncio.gather(*build_tasks)
         
-        for path in os.scandir(plugin_output_dir):
-            if path.name.endswith('.so'):
-                final_path = os.path.join(plugin_final_dir, path.name)
-                print(f"moving {path.path} to {final_path}")
-                os.rename(path.path, final_path)
-                break
-        else:
-            print(f"[WARN] Couldn't find a plugin for {plugin_path}")
+        for plugin_path in os.scandir(plugins_dir):
+            if not plugin_path.is_dir():
+                continue
+                
+            plugin_output_dir = os.path.join(plugin_path.path, "./target/release/")
+            if not os.path.exists(plugin_output_dir):
+                print(f"[WARN] Build output directory not found for {plugin_path.name}")
+                continue
+            
+            for path in os.scandir(plugin_output_dir):
+                if path.name.endswith('.so') or path.name.endswith('.dll'):
+                    final_path = os.path.join(plugin_final_dir, path.name)
+                    print(f"moving {path.path} to {final_path}")
+                    try:
+                        if os.path.exists(final_path):
+                            os.remove(final_path)
+                        os.rename(path.path, final_path)
+                        break
+                    except OSError as e:
+                        print(f"[ERROR] Failed to move plugin {path.name}: {e}")
+            else:
+                print(f"[WARN] Couldn't find a plugin for {plugin_path.name}")
+    else:
+        print("[INFO] No plugins found to build")
 
 
 async def build_repo(repo_dir: str, target_native: bool) -> None:
@@ -107,7 +123,7 @@ async def build_repo(repo_dir: str, target_native: bool) -> None:
         env["RUSTFLAGS"] = "-C target-cpu=native"
     
     await run_command(
-        "cargo build --release --config profile.release.debug=true",
+        "cargo build --release",
         env=env
     )
 
